@@ -1727,8 +1727,13 @@ async def get_or_build_daily(
         return resolve_source_candidates(items, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
 
     async def from_charts_fallback(on_track=None, should_stop=None) -> list[dict]:
-        """榜单兜底：当网易云未登录且 lx 自定义音源无可用榜单时，
-        直接从酷狗 TOP500 / 飙升榜获取热门歌曲（免登录公网直连）。
+        """榜单兜底：严格按照当前激活的音源获取热门歌曲。
+        - 若当前是网易云音源 (netease_enabled)：
+          抓取网易云官方免登录榜单（热歌榜/飙升榜），确保 source 为 netease（走网易云解析播放）
+        - 若当前是洛雪音源 (lx_enabled)：
+          抓取酷狗 TOP500 / 飙升榜 / 网易新歌榜，统一封装为 lx 格式（走洛雪自定义源解析播放）
+        - 若当前是 musicdl (musicdl_client)：
+          抓取热门歌曲后通过 musicdl 检索匹配（走 musicdl 解析播放）
         """
         if not recommend_hot:
             return []
@@ -1738,24 +1743,99 @@ async def get_or_build_daily(
             import charts as chart_mod
 
         day = today_key()
-        # 1. 优先读取已缓存的榜单（0ms 本地磁盘直出）
-        for cid in ("kg_8888", "kg_6666", "kg_23784"):
-            cached_tracks = chart_mod.load_chart_cache(cid, day)
-            if cached_tracks:
-                res = resolve_source_candidates(cached_tracks, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
-                if res:
-                    return res
 
-        # 2. 无本地缓存时，通过 charts 模块直连抓取酷狗 TOP500 / 飙升榜
-        for cid in ("kg_8888", "kg_6666"):
-            try:
-                fetched = await chart_mod.get_or_load_chart_tracks(cid, limit=PLAYLIST_SIZE)
-                if fetched:
-                    res = resolve_source_candidates(fetched, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+        # A. 网易云音源：抓取网易云官方免登录榜单 (热歌榜 3778678, 飙升榜 19723756)
+        if netease_enabled:
+            for cid in ("wy_3778678", "wy_19723756"):
+                try:
+                    fetched = await chart_mod.get_or_load_chart_tracks(
+                        cid, netease_enabled=True, limit=PLAYLIST_SIZE
+                    )
+                    if fetched:
+                        adapted = []
+                        for it in fetched:
+                            it_copy = dict(it)
+                            sid = str(it_copy.get("song_id") or it_copy.get("id") or "").replace("netease:", "")
+                            it_copy["id"] = f"netease:{sid}"
+                            it_copy["source"] = "netease"
+                            adapted.append(it_copy)
+                        res = resolve_source_candidates(adapted, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+                        if res:
+                            return res
+                except Exception as e:
+                    logger.debug("from_charts_fallback netease %s failed: %s", cid, e)
+            return []
+
+        # B. 洛雪音源：抓取酷狗 TOP500 / 飙升榜 / 网易榜单，统一封装为 lx 格式
+        if lx_enabled:
+            for cid in ("kg_8888", "kg_6666", "kg_23784", "wy_3778678"):
+                cached_tracks = chart_mod.load_chart_cache(cid, day)
+                if cached_tracks:
+                    adapted = []
+                    for it in cached_tracks:
+                        it_copy = dict(it)
+                        raw_id = str(it_copy.get("id") or "")
+                        if not raw_id.startswith("lx:"):
+                            if "song_id" in it_copy:
+                                raw_id = f"lx:wy:{it_copy['song_id']}"
+                            elif "hash" in it_copy:
+                                raw_id = f"lx:kg:{it_copy['hash']}"
+                            else:
+                                raw_id = f"lx:{raw_id}"
+                        it_copy["id"] = raw_id
+                        it_copy["source"] = "lx"
+                        adapted.append(it_copy)
+                    res = resolve_source_candidates(adapted, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
                     if res:
                         return res
-            except Exception as e:
-                logger.debug("from_charts_fallback for %s failed: %s", cid, e)
+
+            for cid in ("kg_8888", "kg_6666", "wy_3778678"):
+                try:
+                    fetched = await chart_mod.get_or_load_chart_tracks(cid, limit=PLAYLIST_SIZE)
+                    if fetched:
+                        adapted = []
+                        for it in fetched:
+                            it_copy = dict(it)
+                            raw_id = str(it_copy.get("id") or "")
+                            if not raw_id.startswith("lx:"):
+                                if "song_id" in it_copy:
+                                    raw_id = f"lx:wy:{it_copy['song_id']}"
+                                elif "hash" in it_copy:
+                                    raw_id = f"lx:kg:{it_copy['hash']}"
+                                else:
+                                    raw_id = f"lx:{raw_id}"
+                            it_copy["id"] = raw_id
+                            it_copy["source"] = "lx"
+                            adapted.append(it_copy)
+                        res = resolve_source_candidates(adapted, build_track, PLAYLIST_SIZE, exclude_guids, exclude_ta)
+                        if res:
+                            return res
+                except Exception as e:
+                    logger.debug("from_charts_fallback lx %s failed: %s", cid, e)
+            return []
+
+        # C. musicdl 音源：抓取热门歌曲后，通过 musicdl 检索匹配
+        if musicdl_client:
+            chart_tracks = []
+            for cid in ("kg_8888", "wy_3778678"):
+                try:
+                    chart_tracks = await chart_mod.get_or_load_chart_tracks(cid, limit=PLAYLIST_SIZE)
+                    if chart_tracks:
+                        break
+                except Exception:
+                    pass
+            if chart_tracks:
+                recs = [
+                    {"title": str(t.get("title") or ""), "artist": str(t.get("artist") or "")}
+                    for t in chart_tracks if t.get("title")
+                ]
+                return await resolve_recommendations(
+                    recs, musicdl_client=musicdl_client, musicbox_client=None,
+                    netease_enabled=False, build_track=build_track, limit=PLAYLIST_SIZE,
+                    exclude_guids=exclude_guids, exclude_ta=exclude_ta,
+                    on_track=on_track, should_stop=should_stop,
+                )
+
         return []
 
     async def from_llm(on_track=None, should_stop=None) -> list[dict]:
@@ -1907,9 +1987,15 @@ async def get_or_build_daily(
     # 热门推荐链：网易热歌榜 -> lx 免登录榜单。每级不足 20 首由下一级补齐。
     # FNMUSIC_RECOMMEND_DAILY / FNMUSIC_RECOMMEND_HOT 分别门控两条链的构建。
     if kind == "hot":
-        await run_tier("netease-charts", from_netease_charts)
-        await run_tier("lx-charts", from_lx_charts)
-        if len(tracks) < PLAYLIST_SIZE:
+        if lx_enabled:
+            await run_tier("lx-charts", from_lx_charts)
+            if len(tracks) < PLAYLIST_SIZE:
+                await run_tier("charts-fallback", from_charts_fallback)
+        elif netease_enabled:
+            await run_tier("netease-charts", from_netease_charts)
+            if len(tracks) < PLAYLIST_SIZE:
+                await run_tier("charts-fallback", from_charts_fallback)
+        else:
             await run_tier("charts-fallback", from_charts_fallback)
     elif recommend_daily:
         if not source_slot_claimed(day):

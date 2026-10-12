@@ -4268,8 +4268,8 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     duration=float((info or {}).get("duration_s") or 0.0),
                 )
                 try:
-                    # 酷狗官方接口已封禁，洛雪音源尝试限时 3.5s，避免卡死整轨下载流程
-                    lx_timeout = 3.5 if guid.startswith("online:lx:kg:") else 22.0
+                    # 洛雪自定义源解析超时放宽至 20s，兼容多级转发及自定义脚本的解析耗时
+                    lx_timeout = 20.0
                     resolved = await asyncio.wait_for(lx_coro, timeout=lx_timeout)
                 except Exception:
                     resolved = None
@@ -4369,6 +4369,34 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                                                 resolved = alt_resolved
                             except Exception as fb_tx_err:
                                 logger.info("Direct tx fallback search failed for %s: %s", guid, fb_tx_err)
+
+                        # C. 若网易与QQ未解出，直接调用洛雪多平台搜索获取可播放替代
+                        if not resolved:
+                            try:
+                                lx_c = get_lx_client(request.app)
+                                sr = await lx_c.get(
+                                    "/api/v1/search",
+                                    params={"keyword": query, "limit": 3},
+                                    timeout=8.0,
+                                )
+                                if sr.status_code == 200:
+                                    s_items = (sr.json() or {}).get("items") or []
+                                    for sit in s_items:
+                                        stid = str(sit.get("id") or "")
+                                        if stid and stid != guid:
+                                            alt_resolved = await resolve_lx_url(
+                                                lx_c,
+                                                stid,
+                                                force_mp3=use_force_mp3,
+                                                name=title,
+                                                singer=artist,
+                                            )
+                                            if alt_resolved and alt_resolved.get("url"):
+                                                logger.info("Found lx cross-search fallback for %s -> %s", guid, stid)
+                                                resolved = alt_resolved
+                                                break
+                            except Exception as fb_lx_err:
+                                logger.debug("Direct lx cross-search fallback failed for %s: %s", guid, fb_lx_err)
 
                 if not resolved:
                     return None
@@ -5513,7 +5541,7 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
         return Response(status_code=full.status_code, headers=dict(full.headers))
     opened = None
     try:
-        opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=4.0)
+        opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=15.0)
     except Exception:
         opened = None
     if not opened:
@@ -5587,7 +5615,7 @@ async def stream_track(request: Request, subpath: str = ""):
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
-    deadline = asyncio.get_running_loop().time() + 12.0
+    deadline = asyncio.get_running_loop().time() + 25.0
     for candidate in list(dict.fromkeys(candidates))[:3]:
         if not _source_enabled(candidate):
             continue
@@ -5596,8 +5624,8 @@ async def stream_track(request: Request, subpath: str = ""):
             if remaining <= 0:
                 break
             try:
-                # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐
-                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(6.0, remaining))
+                # 单次解析预算与音源远程解析（含二级转发与探活）对齐，留足网络抖动余量
+                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(15.0, remaining))
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
                 opened = None
