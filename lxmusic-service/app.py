@@ -755,8 +755,14 @@ async def _verify_result(client: httpx.AsyncClient, result: dict | None,
                                             report_transport=report_transport)
         if not ok:
             return None
+        res_headers = dict(result.get("headers") or {})
+        res_headers.setdefault("User-Agent", UA_PC)
         result.update(url=final, file_size=size or result.get("file_size") or 0,
-                      ext=ct.split("/")[-1], probed=True)
+                      ext=ct.split("/")[-1], probed=True, headers=res_headers)
+    else:
+        res_headers = dict(result.get("headers") or {})
+        res_headers.setdefault("User-Agent", UA_PC)
+        result["headers"] = res_headers
     result.update(validation_status="media_verified", completeness="unknown")
     result["actual_tier"] = _actual_tier(result)
     return result
@@ -1765,8 +1771,11 @@ async def track_url(
     quality: str = Query("lossless"),
     name: str = Query("", alias="name"),
     singer: str = Query("", alias="singer"),
+    title: str = Query("", alias="title"),
+    artist: str = Query("", alias="artist"),
     album: str = Query("", alias="album"),
     duration: float = Query(0.0, alias="duration"),
+    cover: str = Query("", alias="cover"),
 ):
     track_id = (id or guid or "").strip()
     src, identifier = parse_track_id(track_id)
@@ -1774,15 +1783,22 @@ async def track_url(
         return _err(f"invalid track id: {track_id}", 400)
     _STATS["url_resolutions"] += 1
     canonical_id = f"lx:{src}:{identifier}"
+    s_name = (name or title or "").strip()
+    s_singer = (singer or artist or "").strip()
     cached = _cache_get(canonical_id) or {"id": canonical_id, "lx_source": src}
-    if name and not cached.get("title"):
-        cached["title"] = name
-    if singer and not cached.get("artist"):
-        cached["artist"] = singer
-    if album and not cached.get("album"):
+    if s_name:
+        cached["title"] = s_name
+        cached["name"] = s_name
+    if s_singer:
+        cached["artist"] = s_singer
+        cached["singer"] = s_singer
+    if album:
         cached["album"] = album
-    if duration > 0 and not cached.get("duration_s"):
+        cached["albumName"] = album
+    if duration > 0:
         cached["duration_s"] = duration
+    if cover:
+        cached["cover_url"] = cover
     _cache_put(cached)
     client = get_http(app)
     try:

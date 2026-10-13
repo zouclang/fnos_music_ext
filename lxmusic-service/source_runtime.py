@@ -249,15 +249,15 @@ def build_music_info(item: dict, platform: str) -> dict:
     info = {
         "songmid": identifier,
         "songId": identifier,
-        "name": str(item.get("title") or ""),
-        "singer": str(item.get("artist") or ""),
+        "name": str(item.get("title") or item.get("name") or ""),
+        "singer": str(item.get("artist") or item.get("singer") or ""),
         "source": platform,
-        "interval": seconds_str(item.get("duration_s")),
-        "albumName": str(item.get("album") or ""),
+        "interval": seconds_str(item.get("duration_s") or item.get("duration")),
+        "albumName": str(item.get("album") or item.get("albumName") or ""),
         "meta": {
             "songId": identifier,
-            "albumName": str(item.get("album") or ""),
-            "picUrl": str(item.get("cover_url") or "") or None,
+            "albumName": str(item.get("album") or item.get("albumName") or ""),
+            "picUrl": str(item.get("cover_url") or item.get("cover") or item.get("picUrl") or "") or None,
         },
     }
     # identifier 即 "lx:<platform>:<identifier>" 的平台主键：条目缺字段时兜底，

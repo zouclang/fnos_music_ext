@@ -2454,16 +2454,16 @@ async def resolve_lx_url(
     # 自动从榜单或曲目缓存中补全歌曲名与歌手，供洛雪脚本正常传参及跨源兜底
     if not name or not singer:
         lookup_guid = guid or (f"online:{song_id}" if song_id.startswith("lx:") else f"online:lx:{song_id}")
-        meta = _ONLINE_TRACK_CACHE.get(lookup_guid) or charts.find_track(lookup_guid) or {}
+        meta = _lookup_online_meta(lookup_guid)
         if not name:
             name = str(meta.get("title") or meta.get("name") or "").strip()
         if not singer:
-            singer = str(meta.get("artist") or "").strip()
+            singer = str(meta.get("artist") or meta.get("singer") or "").strip()
         if not album:
-            album = str(meta.get("album") or "").strip()
+            album = str(meta.get("album") or meta.get("albumName") or "").strip()
         if duration <= 0:
             try:
-                duration = float(meta.get("duration_s") or 0.0)
+                duration = float(meta.get("duration_s") or meta.get("duration") or 0.0)
             except (TypeError, ValueError):
                 duration = 0.0
 
@@ -2481,8 +2481,10 @@ async def resolve_lx_url(
             params = {"id": song_id, "quality": q}
             if name:
                 params["name"] = name
+                params["title"] = name
             if singer:
                 params["singer"] = singer
+                params["artist"] = singer
             if album:
                 params["album"] = album
             if duration > 0:
@@ -2729,6 +2731,123 @@ def _tag_fields(info: dict | None) -> tuple[str, str, str]:
 def _cover_url_of(info: dict | None) -> str:
     src = info if isinstance(info, dict) else {}
     return str(src.get("cover_url") or src.get("coverUrl") or src.get("coverURL") or "").strip()
+
+
+_LX_MEDIA_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
+def _lx_media_headers(resolved: "dict | None") -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for key, value in ((resolved or {}).get("headers") or {}).items():
+        if key.lower() in ("referer", "user-agent"):
+            headers[key] = str(value)
+    headers.setdefault("User-Agent", _LX_MEDIA_UA)
+    return headers
+
+
+_ONLINE_META_MAX = 2048
+_ONLINE_META: "dict[str, dict]" = {}
+_ONLINE_META_UNKNOWN_TITLES = {"未知曲目", "未知歌曲", "未知音乐", "unknown"}
+
+
+def register_online_meta(items) -> int:
+    added = 0
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        guid = online_guid_from_item(it)
+        if not is_online_guid(guid):
+            guid = str(it.get("guid") or "")
+        if not is_online_guid(guid):
+            continue
+        title, artist, album = _tag_fields(it)
+        if not title or title in _ONLINE_META_UNKNOWN_TITLES:
+            continue
+        duration_s = it.get("duration_s")
+        if not duration_s:
+            ms = it.get("duration")
+            if isinstance(ms, (int, float)) and ms > 1000:
+                duration_s = ms / 1000.0
+        try:
+            dur = float(duration_s or 0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        cov = _cover_url_of(it)
+        entry = {
+            "title": str(title).strip(),
+            "artist": str(artist).strip(),
+            "album": str(album or "").strip(),
+            "duration_s": dur,
+            "cover_url": cov,
+        }
+        _ONLINE_META[guid] = entry
+        _cache_online_track(guid, {**it, **entry})
+        added += 1
+    return added
+
+
+def _online_meta_get(guid: str) -> "dict | None":
+    return _ONLINE_META.get(str(guid))
+
+
+def _lookup_online_meta(guid: str) -> dict:
+    if not guid:
+        return {}
+    m = _ONLINE_TRACK_CACHE.get(guid)
+    if m and (m.get("title") or m.get("name")):
+        return m
+    m = charts.find_track(guid)
+    if m and (m.get("title") or m.get("name")):
+        return m
+    m = _online_meta_get(guid)
+    if m and (m.get("title") or m.get("name")):
+        return m
+    for directory in (dailyrec.recommend_cache_dir(),):
+        for path in _iter_registry_jsons(directory):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                tracks = data.get("tracks") if isinstance(data, dict) else None
+                for t in tracks or []:
+                    if isinstance(t, dict):
+                        tg = str(t.get("guid") or t.get("id") or "")
+                        if tg == guid or online_guid_from_item(t) == guid:
+                            _cache_online_track(guid, t)
+                            return t
+            except Exception:
+                continue
+    return {}
+
+
+def _sync_recommend_version_marker() -> None:
+    ver = get_version()
+    path = os.path.join(dailyrec.recommend_cache_dir(), ".last-version")
+    prev = ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            prev = f.read().strip()
+    except OSError:
+        pass
+    if prev == ver:
+        return
+    removed = 0
+    if prev:
+        removed = dailyrec.invalidate_today_cache_all_users()
+        _cancel_daily_tasks()
+    try:
+        os.makedirs(dailyrec.recommend_cache_dir(), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(ver)
+    except OSError as e:
+        logger.warning("failed to write recommend version marker: %s", e)
+    if prev:
+        logger.info(
+            "版本变化(%s → %s)：已失效当日推荐缓存 %d 个，推荐歌单将按新版本重建",
+            prev, ver, removed,
+        )
 
 
 def _item_meta_richness(it: dict) -> int:
@@ -3246,6 +3365,7 @@ async def lifespan(fastapi_app: FastAPI):
 
     ensure_registry_warm()
     charts.preload_local_caches()
+    _sync_recommend_version_marker()
     charts_warmup_task = None
     if _background_jobs_enabled() and CONF.get("charts_enabled", True):
         charts_list = charts.list_enabled_charts(
@@ -4278,7 +4398,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
             else:
                 use_force_mp3 = force_mp3 or _lossless_is_blacklisted(guid)
                 if info is None:
-                    info = _ONLINE_TRACK_CACHE.get(guid) or charts.find_track(guid)
+                    info = _lookup_online_meta(guid)
                 if not (info and (info.get("title") or info.get("name"))) and guid.startswith("online:lx:kg:"):
                     kg_meta = await _resolve_kg_hash_meta(guid.split(":")[-1])
                     if kg_meta:
@@ -4432,11 +4552,9 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                     return None
                 url = resolved["url"]
                 ext = resolved.get("ext")
-                for key, value in (resolved.get("headers") or {}).items():
-                    if key.lower() in ("referer", "user-agent"):
-                        headers[key] = str(value)
+                headers.update(_lx_media_headers(resolved))
             if info is None:
-                info = charts.find_track(guid)
+                info = _lookup_online_meta(guid)
             if info is None:
                 try:
                     info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
@@ -5717,9 +5835,7 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
             )
             if not resolved or not resolved.get("url"):
                 return None, None
-            headers = {k: str(v) for k, v in (resolved.get("headers") or {}).items()
-                       if k.lower() in ("referer", "user-agent")}
-            return str(resolved["url"]), headers or None
+            return str(resolved["url"]), _lx_media_headers(resolved)
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
         if _lossless_is_blacklisted(guid):
             url += "&quality=mp3"
@@ -7707,8 +7823,12 @@ async def _load_daily_bundle(request: Request, user_guid: str, kind: str = "dail
     dailyrec.purge_stale_daily_cache(user_guid, day)
     cached = dailyrec.load_daily_cache(user_guid, day, kind)
     if cached and cached.get("tracks"):
+        register_online_meta(cached.get("tracks"))
         return cached
-    return await _wait_progressive_bundle(request, user_guid, kind, timeout_s=20.0)
+    res = await _wait_progressive_bundle(request, user_guid, kind, timeout_s=20.0)
+    if res and res.get("tracks"):
+        register_online_meta(res.get("tracks"))
+    return res
 
 
 # === playlist tracks（官方歌单内的在线附加条目）===
@@ -8238,9 +8358,9 @@ async def playlist_track_list(request: Request):
         is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        tracks = dailyrec.stamp_playlist_tracks(
-            await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
-        )
+        nm_raw = await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
+        register_online_meta(nm_raw)
+        tracks = dailyrec.stamp_playlist_tracks(nm_raw)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):
@@ -8356,6 +8476,7 @@ async def playlist_track_list(request: Request):
             g = online_guid_from_item(t)
             fake_official_guid(g)
             _cache_online_track(g, t)
+        register_online_meta(raw_tracks)
         tracks = [build_online_track(t) for t in raw_tracks]
         tracks = dailyrec.stamp_playlist_tracks(tracks)
         try:
@@ -8403,7 +8524,9 @@ async def playlist_track_list(request: Request):
     if not is_authed and auth_resp is not None:
         return auth_resp
     bundle = await _load_daily_bundle(request, user_guid, kind)
-    tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    bundle_tracks = list(bundle.get("tracks") or [])
+    register_online_meta(bundle_tracks)
+    tracks = dailyrec.stamp_playlist_tracks(bundle_tracks)
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
