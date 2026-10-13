@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+## [2.9.3] - 2026-10-13
+
+### 彻底修复播放端点误转发上游 404 及在线路径 GUID 反解失败导致的全部歌曲无法播放问题
+
+- **修复播放端点对在线路径形 URL (`online/src/guid.ext`) 误转发至上游官方导致 404 的根本 Bug**：
+  - 此前 `/music/api/v1/track/stream/{subpath:path}`、`lyric/list` 及 `track/lyrics` 接口中使用了 `subpath if is_online_guid(subpath) else None` 条件判断；
+  - 飞牛 Web 播放器下发请求时传递的路径为 `online/lx/5f37a468...flac`，因路径形字符串不满足以 `online:` 开头的校验，导致 `subpath` 被错误置空丢弃，直接误判为官方曲目并透传至上游官方后端，造成官方上游因找不到物理文件而返回 404 无法播放；
+  - 现已彻底修复为无条件传递 `subpath or None` 经由 `extract_guid` 与 `resolve_real_guid` 规范解析，杜绝误透传上游 404。
+- **全方位增强 `resolve_real_guid` 32-hex 假 ID 与路径反解能力**：
+  - 完美支持从 `online/src/5f37a468...flac`、带/不带前导斜杠或包含扩展名的路径形态中自动提取 32 位 hex 假 ID 并命中逆向映射表；
+  - `extract_guid` 全面接入 `request.query_params.get("path")` 查询参数检查，无论客户端以路径参数还是 Query 参数请求均能 100% 正确反解真实在线音源 GUID；
+  - 增强 `_register_fakes_from_items` 预热注册表逻辑，确保从推荐缓存与榜单历史冷启动恢复时无遗漏。
+- **优化洛雪自定义源本地脚本路径解析兼容性**：
+  - 支持 `file:///data/lxmusic/uploads/...` 中包含中文与空格等特殊字符时的 URL 解码，提升自定义源脚本加载鲁棒性。
+
 ## [2.9.2] - 2026-10-12
 
 ### 彻底解决热门推荐榜单音源归属（严格按用户所选音源）与跳歌问题

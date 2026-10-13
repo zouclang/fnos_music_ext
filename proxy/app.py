@@ -894,7 +894,7 @@ def extract_keyword(request: Request) -> str:
 
 
 def online_guid_from_item(item: dict) -> str:
-    raw_id = str(item.get("id") or "")
+    raw_id = str(item.get("id") or item.get("guid") or "")
     src = str(item.get("source") or "")
     if raw_id.startswith("online:"):
         return raw_id
@@ -2897,9 +2897,12 @@ def _register_fakes_from_items(items) -> None:
         if not isinstance(it, dict):
             continue
         g = str(it.get("guid") or "")
+        if not is_online_guid(g):
+            g = online_guid_from_item(it)
         nested = it.get("track") if isinstance(it.get("track"), dict) else None
         if is_online_guid(g):
             fake_official_guid(g)
+            _cache_online_track(g, it)
             # 专辑假 id 一并登记（issue #22）：收藏/历史/歌单附加/推荐缓存里的
             # 快照带专辑名，重建时保住专辑详情的反解依据
             src_obj = nested if nested is not None else it
@@ -2998,6 +3001,8 @@ def resolve_real_guid(candidate: str) -> str:
     raw = str(candidate).strip()
     if not raw:
         return raw
+    if raw.startswith("online:"):
+        return raw
     if raw in _FAKE_GUID_REVERSE:
         return _FAKE_GUID_REVERSE[raw]
     low = raw.lower()
@@ -3006,14 +3011,25 @@ def resolve_real_guid(candidate: str) -> str:
     stripped = low[6:] if low.startswith("track_") and len(low) > 6 else low
     if stripped in _FAKE_GUID_REVERSE:
         return _FAKE_GUID_REVERSE[stripped]
-    if re.fullmatch(r"[0-9a-f]{32}", stripped):
+
+    # 字符串内嵌原始在线 GUID（如路径 online/lx/online:lx:kg:xxx.flac）
+    m_online = _ONLINE_ID_RE.search(raw)
+    if m_online:
+        return m_online.group(0)
+
+    # 提取字符串内的 32-hex 假 ID（支持从 online/src/5f37a468...flac 等任意路径或参数中反解）
+    hex_candidates = re.findall(r"[0-9a-f]{32}", low)
+    for h in hex_candidates:
+        if h in _FAKE_GUID_REVERSE:
+            return _FAKE_GUID_REVERSE[h]
+
+    # 若未命中，尝试预热注册表（从磁盘缓存/榜单缓存/收藏历史中恢复）后再查
+    if hex_candidates:
         ensure_registry_warm()
-        if stripped in _FAKE_GUID_REVERSE:
-            return _FAKE_GUID_REVERSE[stripped]
-    if re.fullmatch(r"[0-9a-f]{32}", low):
-        ensure_registry_warm()
-        if low in _FAKE_GUID_REVERSE:
-            return _FAKE_GUID_REVERSE[low]
+        for h in hex_candidates:
+            if h in _FAKE_GUID_REVERSE:
+                return _FAKE_GUID_REVERSE[h]
+
     return raw
 
 
@@ -3045,36 +3061,50 @@ def disguise_client_json(obj):
 
 def extract_guid(request: Request, path_guid: str | None = None) -> str:
     if path_guid:
-        return resolve_real_guid(path_guid)
-    return resolve_real_guid(
+        resolved = resolve_real_guid(path_guid)
+        if is_online_guid(resolved):
+            return resolved
+    query_candidate = (
         request.query_params.get("guid")
         or request.query_params.get("trackGUID")
         or request.query_params.get("trackGuid")
         or request.query_params.get("coverId")
         or request.query_params.get("id")
         or request.query_params.get("trackId")
+        or request.query_params.get("path")
         or ""
     )
+    if query_candidate:
+        resolved = resolve_real_guid(query_candidate)
+        if is_online_guid(resolved):
+            return resolved
+    if path_guid:
+        return resolve_real_guid(path_guid)
+    return resolve_real_guid(query_candidate)
 
 
 async def extract_guid_from_body(request: Request) -> str:
     guid = extract_guid(request)
-    if guid:
+    if guid and is_online_guid(guid):
         return guid
     try:
         body = await request.json()
     except Exception:
-        return ""
+        return guid or ""
     if isinstance(body, dict):
-        return resolve_real_guid(str(
+        candidate = (
             body.get("guid")
             or body.get("trackGUID")
             or body.get("trackGuid")
             or body.get("id")
             or body.get("trackId")
+            or body.get("path")
             or ""
-        ))
-    return ""
+        )
+        resolved = resolve_real_guid(str(candidate))
+        if resolved:
+            return resolved
+    return guid or ""
 
 
 def empty_ok() -> JSONResponse:
@@ -5599,7 +5629,7 @@ def ordered_stream_alternatives(item: dict) -> list[dict]:
 @app.api_route("/music/api/v1/track/stream", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
 async def stream_track(request: Request, subpath: str = ""):
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    guid = extract_guid(request, subpath or None)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     range_header = request.headers.get("range")
@@ -6182,7 +6212,7 @@ async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = 
 @app.get("/music/api/v1/lyric/list")
 @app.get("/music/api/v1/lyric/list/{subpath:path}")
 async def lyric_list(request: Request, subpath: str = ""):
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    guid = extract_guid(request, subpath or None)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -6194,7 +6224,7 @@ async def lyric_list(request: Request, subpath: str = ""):
 @app.get("/music/api/v1/track/lyrics/{subpath:path}")
 @app.get("/music/api/v1/detail/lyrics/{subpath:path}")
 async def track_lyrics(request: Request, subpath: str = ""):
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    guid = extract_guid(request, subpath or None)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 

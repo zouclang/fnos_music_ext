@@ -19,6 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 
@@ -147,7 +148,9 @@ async def download_script(url: str) -> str:
     """
     url = (url or "").strip()
     if _FILE_URL_RE.match(url):
-        path = url[len("file://"):]
+        raw_path = url[len("file://"):]
+        unquoted = unquote(raw_path)
+        path = unquoted if os.path.exists(unquoted) else raw_path
         if not path.startswith("/"):
             raise SourceError("download", "file:// 路径必须是绝对路径")
         try:
